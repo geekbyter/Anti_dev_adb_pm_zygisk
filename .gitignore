@@ -1,0 +1,8 @@
+/obj/
+/libs/
+/module/zygisk/
+*.zip
+*.o
+*.o.d
+*.so
+null

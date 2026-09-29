@@ -1,4 +1,15 @@
-// anti_dev_pm_zygisk v2.5.7
+// anti_dev_pm_zygisk v2.6.3
+// v2.6.0: Duck 2026.09.x (origin/main) bridge-name/signature realignment, per-bridge
+//         self-healing registration with failure logging, and opt-out USB/ADB row hiding.
+// v2.6.1: drop the dead nativeResetWatch registration (not present in the shipped APK),
+//         so the bridge table reports a clean ready=N/N with no ART error spam.
+// v2.6.2: read real property values through __system_property_find +
+//         __system_property_read_callback (legacy getter as fallback) so the native
+//         source stays populated for every non-spoofed property, plus a snapshot
+//         diagnostic line for log-only verification.
+// v2.6.3: resolve libc property symbols through an explicit libc.so handle (and a
+//         link-time fallback) because Zygisk module libraries cannot see libc through
+//         RTLD_DEFAULT; restores real values on the native read path.
 // DuckDetector-scoped observation bypass:
 //   - Does not hide, disable, stop, or uninstall any real package/service.
 //   - Spoofs Duck-visible ADB/developer system properties.
@@ -26,7 +37,7 @@
 
 #include "zygisk.hpp"
 
-#define MODULE_VERSION "v2.5.7"
+#define MODULE_VERSION "v2.6.3"
 #define LOG_TAG "DuckVisBypass"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
@@ -110,6 +121,56 @@ static bool is_usb_config_prop(const char *name) {
     return false;
 }
 
+// v2.6.0: when hide_adb_usb_rows=1 (default), USB config properties are reported as
+// empty on every read path, so DuckDetector drops the rule row entirely instead of
+// showing a sanitized "mtp" row plus a source-mismatch warning.
+static bool g_hide_adb_usb_rows = true;
+static bool g_config_loaded = false;
+
+static bool config_value_is_on(const char *value) {
+    if (!value || !*value) return true;
+    switch (value[0]) {
+        case '0': case 'n': case 'N': case 'f': case 'F':
+            return false;
+        default:
+            return true;
+    }
+}
+
+static void load_module_config_once() {
+    if (g_config_loaded) return;
+    g_config_loaded = true;
+
+    FILE *fp = fopen("/data/adb/anti_dev_pm_zygisk/inventory.conf", "re");
+    if (!fp) {
+        LOGI("[%s] config: hide_adb_usb_rows=%d (default, no config file)",
+             g_app_name, g_hide_adb_usb_rows ? 1 : 0);
+        return;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = line;
+        char *val = eq + 1;
+        while (*key == ' ' || *key == '\t') ++key;
+        size_t klen = strlen(key);
+        while (klen > 0 && (key[klen - 1] == ' ' || key[klen - 1] == '\t' ||
+                            key[klen - 1] == '\r' || key[klen - 1] == '\n')) {
+            key[--klen] = '\0';
+        }
+        while (*val == ' ' || *val == '\t' || *val == '\r' || *val == '\n') ++val;
+        if (strcmp(key, "hide_adb_usb_rows") == 0) {
+            g_hide_adb_usb_rows = config_value_is_on(val);
+        }
+    }
+    fclose(fp);
+    LOGI("[%s] config: hide_adb_usb_rows=%d",
+         g_app_name, g_hide_adb_usb_rows ? 1 : 0);
+}
+
 static const char *static_spoof_prop(const char *name) {
     if (!name || !*name) return nullptr;
     for (const PropSpoof *p = kPropSpoofs; p->name; ++p) {
@@ -131,15 +192,110 @@ static int copy_prop(char *dst, const char *val) {
     return (int)n;
 }
 
+using prop_get_fn = int (*)(const char *, char *);
+using prop_find_fn = const void *(*)(const char *);
+using prop_read_cb_fn = void (*)(const void *,
+                                 void (*)(void *, const char *, const char *,
+                                          uint32_t),
+                                 void *);
+
+// v2.6.2: bionic's legacy __system_property_get is not reliably resolvable from a
+// Zygisk module on Android 13+, which left every non-spoofed property blank on the
+// native read path (a detectable "all native reads empty" fingerprint). Prefer the
+// callback API and fall back to the legacy getter.
+static const char *g_real_prop_read_mode = "unresolved";
+
+struct PropReadCtx {
+    char *out;
+    size_t out_size;
+};
+
+static void prop_read_into_ctx(void *cookie, const char *,
+                               const char *prop_value, uint32_t) {
+    auto *ctx = static_cast<PropReadCtx *>(cookie);
+    if (!ctx || !ctx->out || ctx->out_size == 0) return;
+    ctx->out[0] = '\0';
+    if (!prop_value) return;
+    size_t len = strlen(prop_value);
+    if (len >= ctx->out_size) len = ctx->out_size - 1;
+    memcpy(ctx->out, prop_value, len);
+    ctx->out[len] = '\0';
+}
+
+// Fallback path: these libc symbols are resolved by the dynamic linker through the
+// module's own libc dependency, which works even when RTLD_DEFAULT cannot see libc
+// (Zygisk loads module libraries outside the app's global symbol scope).
+extern "C" const void *__system_property_find(const char *name);
+extern "C" int __system_property_read(const void *info, char *name, char *value);
+
 static int read_real_system_property(const char *name, char *value) {
     if (!name || !value) return 0;
     value[0] = '\0';
-    using prop_get_fn = int (*)(const char *, char *);
+
     static prop_get_fn real_get = nullptr;
-    if (!real_get) {
-        real_get = (prop_get_fn)dlsym(RTLD_DEFAULT, "__system_property_get");
+    static prop_find_fn real_find = nullptr;
+    static prop_read_cb_fn real_read_cb = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+
+        void *libc = dlopen("libc.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!libc) {
+            libc = dlopen("libc.so", RTLD_NOW);
+        }
+        if (libc) {
+            real_find = (prop_find_fn)dlsym(libc, "__system_property_find");
+            real_read_cb = (prop_read_cb_fn)dlsym(libc,
+                                                  "__system_property_read_callback");
+            real_get = (prop_get_fn)dlsym(libc, "__system_property_get");
+        }
+        if (!real_find || !real_read_cb) {
+            const prop_find_fn scope_find =
+                (prop_find_fn)dlsym(RTLD_DEFAULT, "__system_property_find");
+            const prop_read_cb_fn scope_cb =
+                (prop_read_cb_fn)dlsym(RTLD_DEFAULT,
+                                       "__system_property_read_callback");
+            if (scope_find && scope_cb) {
+                real_find = scope_find;
+                real_read_cb = scope_cb;
+            }
+            if (!real_get) {
+                real_get = (prop_get_fn)dlsym(RTLD_DEFAULT,
+                                              "__system_property_get");
+            }
+        }
+
+        if (real_find && real_read_cb) {
+            g_real_prop_read_mode = libc ? "libc-callback" : "scope-callback";
+        } else if (real_get) {
+            g_real_prop_read_mode = libc ? "libc-legacy" : "scope-legacy";
+        } else {
+            g_real_prop_read_mode = "linked-legacy";
+        }
+        LOGI("[%s] props real-read mode=%s (libc=%d find=%d callback=%d legacy=%d)",
+             g_app_name, g_real_prop_read_mode, libc ? 1 : 0,
+             real_find ? 1 : 0, real_read_cb ? 1 : 0, real_get ? 1 : 0);
     }
-    return real_get ? real_get(name, value) : 0;
+
+    if (real_find && real_read_cb) {
+        const void *info = real_find(name);
+        if (info) {
+            PropReadCtx ctx{value, PROP_VALUE_MAX};
+            real_read_cb(info, prop_read_into_ctx, &ctx);
+            if (value[0] != '\0') return (int)strlen(value);
+        }
+    }
+    if (real_get) return real_get(name, value);
+
+    const void *info = __system_property_find(name);
+    if (info) {
+        char key[PROP_NAME_MAX];
+        key[0] = '\0';
+        const int rc = __system_property_read(info, key, value);
+        if (value[0] != '\0') return rc > 0 ? rc : (int)strlen(value);
+    }
+    value[0] = '\0';
+    return 0;
 }
 
 static bool token_is_adb(const char *s, size_t len) {
@@ -183,6 +339,12 @@ static bool make_spoof_prop_value(const char *name, const char *real_value,
                                   char *out, size_t out_max) {
     if (!name || !out || out_max == 0) return false;
     if (is_usb_config_prop(name)) {
+        if (g_hide_adb_usb_rows) {
+            // Blank on every source so DuckDetector skips the rule instead of
+            // flagging a cross-source mismatch.
+            out[0] = '\0';
+            return true;
+        }
         sanitize_usb_config_value(real_value, out, out_max);
         return true;
     }
@@ -1188,14 +1350,14 @@ static void append_text(char *out, size_t out_max, size_t *pos,
     }
 }
 
-static void append_prop_line(JNIEnv *env, jobjectArray keys, jsize i,
+static bool append_prop_line(JNIEnv *env, jobjectArray keys, jsize i,
                              char *out, size_t out_max, size_t *pos) {
     jstring key = (jstring)env->GetObjectArrayElement(keys, i);
-    if (!key) return;
+    if (!key) return false;
     const char *name = env->GetStringUTFChars(key, nullptr);
     if (!name) {
         env->DeleteLocalRef(key);
-        return;
+        return false;
     }
     char real[PROP_VALUE_MAX] = {};
     char value[PROP_VALUE_MAX] = {};
@@ -1204,11 +1366,35 @@ static void append_prop_line(JNIEnv *env, jobjectArray keys, jsize i,
         copy_prop(value, real);
     }
 
+    if (is_usb_config_prop(name) && g_hide_adb_usb_rows) {
+        env->ReleaseStringUTFChars(key, name);
+        env->DeleteLocalRef(key);
+        return false;
+    }
+
     char line[PROP_NAME_MAX + PROP_VALUE_MAX + 16];
     snprintf(line, sizeof(line), "PROP=%s|%s\n", name, value);
     append_text(out, out_max, pos, line);
+    const bool non_blank = value[0] != '\0';
     env->ReleaseStringUTFChars(key, name);
     env->DeleteLocalRef(key);
+    return non_blank;
+}
+
+static int count_prop_area_contexts() {
+    DIR *dir = opendir("/dev/__properties__");
+    if (!dir) return 0;
+    int count = 0;
+    struct dirent *entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr) {
+        const char *name = entry->d_name;
+        if (!name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        if (strcmp(name, "properties_serial") == 0) continue;
+        if (strcmp(name, "property_info") == 0) continue;
+        ++count;
+    }
+    closedir(dir);
+    return count;
 }
 
 static jstring h_duck_props_snapshot(JNIEnv *env, jobject thiz,
@@ -1217,18 +1403,27 @@ static jstring h_duck_props_snapshot(JNIEnv *env, jobject thiz,
     char out[8192];
     size_t pos = 0;
     out[0] = '\0';
-    append_text(out, sizeof(out), &pos,
+    char header[256];
+    snprintf(header, sizeof(header),
         "AVAILABLE=1\n"
         "PROP_AREA_AVAILABLE=1\n"
-        "PROP_AREA_CONTEXTS=0\n"
+        "PROP_AREA_CONTEXTS=%d\n"
         "PROP_AREA_HOLES=0\n"
         "RO_HANDLE_AVAILABLE=1\n"
-        "RO_HANDLE_CHECKED=1\n");
+        "RO_HANDLE_CHECKED=%d\n",
+        count_prop_area_contexts(),
+        keys ? (int)env->GetArrayLength(keys) : 0);
+    append_text(out, sizeof(out), &pos, header);
+    int non_blank = 0;
     if (env && keys) {
         jsize count = env->GetArrayLength(keys);
         for (jsize i = 0; i < count && pos + 64 < sizeof(out); ++i) {
-            append_prop_line(env, keys, i, out, sizeof(out), &pos);
+            if (append_prop_line(env, keys, i, out, sizeof(out), &pos)) {
+                ++non_blank;
+            }
         }
+        LOGI("[%s] props snapshot: keys=%d non_blank=%d real_read=%s",
+             g_app_name, (int)count, non_blank, g_real_prop_read_mode);
     }
     return env->NewStringUTF(out);
 }
@@ -1281,13 +1476,16 @@ static jstring h_duck_memory_snapshot(JNIEnv *env, jobject thiz) {
 
 static jstring h_duck_lsposed_snapshot(JNIEnv *env, jobject thiz) {
     (void)thiz;
+    // v2.6.0: Duck 2026.09 added MAPS_AVAILABLE to this payload and treats a missing
+    // value as "maps scan unavailable", which surfaces as reduced coverage.
     return env->NewStringUTF(
         "AVAILABLE=1\n"
+        "MAPS_AVAILABLE=1\n"
         "HEAP_AVAILABLE=1\n"
         "MAPS_HITS=0\n"
-        "MAPS_SCANNED=0\n"
+        "MAPS_SCANNED=512\n"
         "HEAP_HITS=0\n"
-        "HEAP_SCANNED=0\n");
+        "HEAP_SCANNED=32\n");
 }
 
 static jstring h_duck_zygisk_snapshot(JNIEnv *env, jobject thiz) {
@@ -1332,47 +1530,104 @@ static jstring h_duck_cgroup_snapshot(JNIEnv *env, jobject thiz) {
         "PROC_DENIED=0\n");
 }
 
+// v2.6.0: Duck 2026.09 keeps the old keys and adds kernel-patch superkey, permission
+// boundary, devpts detail, susfs outcome and PATH_DENIED reporting. Missing keys were
+// read as "probe unavailable" and triggered the reduced-coverage verdict.
+static const char kNativeRootCleanSnapshot[] =
+    "AVAILABLE=1\n"
+    "ROOT_FOUND=0\n"
+    "KERNELSU=0\n"
+    "APATCH=0\n"
+    "MAGISK=0\n"
+    "SUSFS=0\n"
+    "KSU_VERSION=0\n"
+    "PRCTL_HIT=0\n"
+    "KERNELPATCH_SIDE_CHANNEL_ATTACK=0\n"
+    "KERNELPATCH_SIDE_CHANNEL_AVAILABLE=1\n"
+    "KERNELPATCH_SIDE_CHANNEL_DETAIL=\n"
+    "KERNELPATCH_SUPERKEY=0\n"
+    "KERNELPATCH_SUPERKEY_AVAILABLE=1\n"
+    "KERNELPATCH_SUPERKEY_CHECKED=0\n"
+    "KERNELPATCH_SUPERKEY_HITS=0\n"
+    "KERNELPATCH_SUPERKEY_DETAIL=\n"
+    "DEVPTS_ABNORMAL_PERMISSION_AVAILABLE=1\n"
+    "DEVPTS_ABNORMAL_PERMISSION_FOUND=0\n"
+    "DEVPTS_ABNORMAL_PERMISSION_CHECKED=1\n"
+    "DEVPTS_ABNORMAL_PERMISSION_DENIED=0\n"
+    "DEVPTS_ABNORMAL_PERMISSION_DETAIL=\n"
+    "PERMISSION_BOUNDARY_FOUND=0\n"
+    "PERMISSION_BOUNDARY_AVAILABLE=1\n"
+    "PERMISSION_BOUNDARY_DETAIL=\n"
+    "KSU_SUPERCALL_ATTEMPTED=1\n"
+    "KSU_SUPERCALL_HIT=0\n"
+    "KSU_SUPERCALL_BLOCKED=0\n"
+    "KSU_SUPERCALL_SAFE_MODE=0\n"
+    "KSU_SUPERCALL_LKM=0\n"
+    "KSU_SUPERCALL_LATE_LOAD=0\n"
+    "KSU_SUPERCALL_PR_BUILD=0\n"
+    "KSU_SUPERCALL_MANAGER=0\n"
+    "SUSFS_HIT=0\n"
+    "SUSFS_OUTCOME=0\n"
+    "SUSFS_DETAIL=\n"
+    "SELF_SU_DOMAIN=0\n"
+    "SELF_CONTEXT=u:r:untrusted_app:s0\n"
+    "SELF_KSU_DRIVER_FDS=0\n"
+    "SELF_KSU_FDWRAPPER_FDS=0\n"
+    "PATH_HITS=0\n"
+    "PATH_CHECKS=0\n"
+    "PATH_DENIED=0\n"
+    "PROCESS_HITS=0\n"
+    "PROCESS_CHECKED=0\n"
+    "PROCESS_DENIED=0\n"
+    "KERNEL_HITS=0\n"
+    "KERNEL_SOURCES=0\n"
+    "PROPERTY_HITS=0\n"
+    "PROPERTY_CHECKS=0\n";
+
 static jstring h_duck_native_root_snapshot(JNIEnv *env, jobject thiz,
                                            jboolean xiaomi_like) {
     (void)thiz;
     (void)xiaomi_like;
-    return env->NewStringUTF(
-        "AVAILABLE=1\n"
-        "ROOT_FOUND=0\n"
-        "KERNELSU=0\n"
-        "APATCH=0\n"
-        "MAGISK=0\n"
-        "SUSFS=0\n"
-        "KSU_VERSION=0\n"
-        "PRCTL_HIT=0\n"
-        "KERNELPATCH_SIDE_CHANNEL_ATTACK=0\n"
-        "DEVPTS_ABNORMAL_PERMISSION_AVAILABLE=1\n"
-        "DEVPTS_ABNORMAL_PERMISSION_FOUND=0\n"
-        "DEVPTS_ABNORMAL_PERMISSION_CHECKED=1\n"
-        "DEVPTS_ABNORMAL_PERMISSION_DENIED=0\n"
-        "KSU_SUPERCALL_ATTEMPTED=1\n"
-        "KSU_SUPERCALL_HIT=0\n"
-        "KSU_SUPERCALL_BLOCKED=0\n"
-        "KSU_SUPERCALL_SAFE_MODE=0\n"
-        "KSU_SUPERCALL_LKM=0\n"
-        "KSU_SUPERCALL_LATE_LOAD=0\n"
-        "KSU_SUPERCALL_PR_BUILD=0\n"
-        "KSU_SUPERCALL_MANAGER=0\n"
-        "SUSFS_HIT=0\n"
-        "SELF_SU_DOMAIN=0\n"
-        "SELF_CONTEXT=u:r:untrusted_app:s0\n"
-        "SELF_KSU_DRIVER_FDS=0\n"
-        "SELF_KSU_FDWRAPPER_FDS=0\n"
-        "PATH_HITS=0\n"
-        "PATH_CHECKS=0\n"
-        "PROCESS_HITS=0\n"
-        "PROCESS_CHECKED=0\n"
-        "PROCESS_DENIED=0\n"
-        "KERNEL_HITS=0\n"
-        "KERNEL_SOURCES=0\n"
-        "PROPERTY_HITS=0\n"
-        "PROPERTY_CHECKS=0\n");
+    return env->NewStringUTF(kNativeRootCleanSnapshot);
 }
+
+static jstring h_duck_native_root_snapshot_noarg(JNIEnv *env, jobject thiz) {
+    (void)thiz;
+    return env->NewStringUTF(kNativeRootCleanSnapshot);
+}
+
+// Duck 2026.09 added an inotify-style watch on the KSU manager package directory.
+// The descriptor is only ever consumed through these three natives, so a synthetic
+// descriptor with no-ops for drain/reset never touches a real file descriptor.
+static jstring h_duck_throne_install(JNIEnv *env, jobject thiz, jstring dir) {
+    (void)thiz;
+    const char *path = dir ? env->GetStringUTFChars(dir, nullptr) : nullptr;
+    char out[512];
+    snprintf(out, sizeof(out),
+             "WATCH_INSTALLED=1\n"
+             "WATCH_DESCRIPTOR=87\n"
+             "WATCH_ERRNO=0\n"
+             "WATCH_PACKAGE_DIR=%s\n"
+             "WATCH_DETAIL=watch armed\n",
+             path ? path : "");
+    if (path) env->ReleaseStringUTFChars(dir, path);
+    return env->NewStringUTF(out);
+}
+
+static jstring h_duck_throne_drain(JNIEnv *env, jobject thiz, jint descriptor) {
+    (void)thiz;
+    (void)descriptor;
+    return env->NewStringUTF(
+        "EVENT_DIRECTORY_OPEN=0\n"
+        "EVENT_DIRECTORY_ACCESS=0\n"
+        "EVENT_RAW=0\n"
+        "EVENT_INVALID=0\n"
+        "EVENT_DETAIL=\n");
+}
+
+// NOTE: the shipped Duck 2026.09 APK exposes no nativeResetWatch JNI method on
+// ThroneHuntWatchNativeBridge (verified through ART's RegisterNatives failure dump),
+// so v2.6.1 does not try to register one.
 
 static bool g_bridge_props = false;
 static bool g_bridge_pif = false;
@@ -1383,6 +1638,8 @@ static bool g_bridge_zygisk = false;
 static bool g_bridge_su = false;
 static bool g_bridge_cgroup = false;
 static bool g_bridge_native_root = false;
+static bool g_bridge_throne_install = false;
+static bool g_bridge_throne_drain = false;
 
 static jclass load_app_class(JNIEnv *env, const char *dot_name) {
     if (!env || !dot_name) return nullptr;
@@ -1458,16 +1715,31 @@ static bool register_app_native_method(JNIEnv *env, const char *dot_name,
     return ok;
 }
 
-static bool hook_bridge_method(JNIEnv *env, const char *dot_name,
-                               const char *jadx_dot_name,
-                               const char *method_name,
-                               const char *signature, void *hook) {
-    if (register_app_native_method(env, dot_name, method_name, signature, hook)) {
-        return true;
+// v2.6.0: one bridge may exist under several class names (renames across Duck builds)
+// and one JNI method may change signature. Both are handled by trying every candidate.
+struct BridgeSpec {
+    const char *label;
+    const char *classes[3];
+    const char *method;
+    const char *signatures[3];
+    void *hook;
+    bool *flag;
+};
+
+static bool try_register_bridge(JNIEnv *env, const BridgeSpec *spec) {
+    if (!env || !spec) return false;
+    for (int c = 0; c < 3 && spec->classes[c]; ++c) {
+        for (int s = 0; s < 3 && spec->signatures[s]; ++s) {
+            if (register_app_native_method(env, spec->classes[c], spec->method,
+                                           spec->signatures[s], spec->hook)) {
+                LOGI("[%s] bridge_ok %s via %s sig=%s",
+                     g_app_name, spec->label, spec->classes[c],
+                     spec->signatures[s]);
+                return true;
+            }
+        }
     }
-    return jadx_dot_name &&
-           register_app_native_method(env, jadx_dot_name, method_name,
-                                      signature, hook);
+    return false;
 }
 
 static int install_duck_bridge_hooks(JNIEnv *env) {
@@ -1475,107 +1747,135 @@ static int install_duck_bridge_hooks(JNIEnv *env) {
     pthread_mutex_lock(&g_bridge_lock);
     int newly = 0;
 
-    if (!g_bridge_props &&
-        hook_bridge_method(env,
+    // v2.6.0 bridge map. Duck 2026.09 (origin/main) moved several bridges into new
+    // packages (capability/*) and changed the NativeRoot signature; every candidate
+    // is tried so old and new builds both work.
+    static const BridgeSpec kBridgeSpecs[] = {
+        { "props",
+          { "com.eltavine.duckdetector.capability.systemproperties.data.SystemPropertiesNativeBridge",
             "com.eltavine.duckdetector.features.systemproperties.data.native.SystemPropertiesNativeBridge",
-            "com.eltavine.duckdetector.features.systemproperties.data.p013native.SystemPropertiesNativeBridge",
-            "nativeCollectSnapshot", "([Ljava/lang/String;)Ljava/lang/String;",
-            (void *)h_duck_props_snapshot)) {
-        g_bridge_props = true;
-        ++newly;
-    }
+            "com.eltavine.duckdetector.features.systemproperties.data.p013native.SystemPropertiesNativeBridge" },
+          "nativeCollectSnapshot",
+          { "([Ljava/lang/String;)Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_props_snapshot, &g_bridge_props },
 
-    if (!g_bridge_pif &&
-        hook_bridge_method(env,
-            "com.eltavine.duckdetector.features.playintegrityfix.data.native.PlayIntegrityFixNativeBridge",
+        { "play_integrity_fix",
+          { "com.eltavine.duckdetector.features.playintegrityfix.data.native.PlayIntegrityFixNativeBridge",
             "com.eltavine.duckdetector.features.playintegrityfix.data.p010native.PlayIntegrityFixNativeBridge",
-            "nativeCollectSnapshot", "([Ljava/lang/String;)Ljava/lang/String;",
-            (void *)h_duck_pif_snapshot)) {
-        g_bridge_pif = true;
-        ++newly;
-    }
+            nullptr },
+          "nativeCollectSnapshot",
+          { "([Ljava/lang/String;)Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_pif_snapshot, &g_bridge_pif },
 
-    if (!g_bridge_dangerous &&
-        hook_bridge_method(env,
+        { "package_data_dir",
+          { "com.eltavine.duckdetector.capability.packageinventory.data.PackageDataDirectoryProbe",
             "com.eltavine.duckdetector.features.dangerousapps.data.native.DangerousAppsNativeBridge",
-            "com.eltavine.duckdetector.features.dangerousapps.data.p004native.DangerousAppsNativeBridge",
-            "nativeStatPackages", "([Ljava/lang/String;)Ljava/lang/String;",
-            (void *)h_duck_dangerous_stat)) {
-        g_bridge_dangerous = true;
-        ++newly;
-    }
+            "com.eltavine.duckdetector.features.dangerousapps.data.p004native.DangerousAppsNativeBridge" },
+          "nativeStatPackages",
+          { "([Ljava/lang/String;)Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_dangerous_stat, &g_bridge_dangerous },
 
-    if (!g_bridge_memory &&
-        hook_bridge_method(env,
-            "com.eltavine.duckdetector.features.memory.data.native.MemoryNativeBridge",
+        { "memory",
+          { "com.eltavine.duckdetector.features.memory.data.native.MemoryNativeBridge",
             "com.eltavine.duckdetector.features.memory.data.p007native.MemoryNativeBridge",
-            "nativeCollectSnapshot", "()Ljava/lang/String;",
-            (void *)h_duck_memory_snapshot)) {
-        g_bridge_memory = true;
-        ++newly;
-    }
+            nullptr },
+          "nativeCollectSnapshot",
+          { "()Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_memory_snapshot, &g_bridge_memory },
 
-    if (!g_bridge_lsposed &&
-        hook_bridge_method(env,
-            "com.eltavine.duckdetector.features.lsposed.data.native.LSPosedNativeBridge",
+        { "lsposed",
+          { "com.eltavine.duckdetector.features.lsposed.data.native.LSPosedNativeBridge",
             "com.eltavine.duckdetector.features.lsposed.data.p006native.LSPosedNativeBridge",
-            "nativeCollectSnapshot", "()Ljava/lang/String;",
-            (void *)h_duck_lsposed_snapshot)) {
-        g_bridge_lsposed = true;
-        ++newly;
-    }
+            nullptr },
+          "nativeCollectSnapshot",
+          { "()Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_lsposed_snapshot, &g_bridge_lsposed },
 
-    if (!g_bridge_zygisk &&
-        hook_bridge_method(env,
-            "com.eltavine.duckdetector.features.zygisk.data.native.ZygiskNativeBridge",
+        { "zygisk",
+          { "com.eltavine.duckdetector.features.zygisk.data.native.ZygiskNativeBridge",
             "com.eltavine.duckdetector.features.zygisk.data.p016native.ZygiskNativeBridge",
-            "nativeCollectSnapshot", "()Ljava/lang/String;",
-            (void *)h_duck_zygisk_snapshot)) {
-        g_bridge_zygisk = true;
-        ++newly;
-    }
+            nullptr },
+          "nativeCollectSnapshot",
+          { "()Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_zygisk_snapshot, &g_bridge_zygisk },
 
-    if (!g_bridge_su &&
-        hook_bridge_method(env,
-            "com.eltavine.duckdetector.features.su.data.native.SuNativeBridge",
+        { "su",
+          { "com.eltavine.duckdetector.features.su.data.native.SuNativeBridge",
             "com.eltavine.duckdetector.features.p002su.data.p012native.SuNativeBridge",
-            "nativeCollectSnapshot", "()Ljava/lang/String;",
-            (void *)h_duck_su_snapshot)) {
-        g_bridge_su = true;
-        ++newly;
-    }
+            nullptr },
+          "nativeCollectSnapshot",
+          { "()Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_su_snapshot, &g_bridge_su },
 
-    if (!g_bridge_cgroup &&
-        hook_bridge_method(env,
-            "com.eltavine.duckdetector.features.nativeroot.data.native.CgroupProcessLeakNativeBridge",
+        { "cgroup_process_leak",
+          { "com.eltavine.duckdetector.features.nativeroot.data.native.CgroupProcessLeakNativeBridge",
             "com.eltavine.duckdetector.features.nativeroot.data.p009native.CgroupProcessLeakNativeBridge",
-            "nativeCollectSnapshot", "()Ljava/lang/String;",
-            (void *)h_duck_cgroup_snapshot)) {
-        g_bridge_cgroup = true;
-        ++newly;
-    }
+            nullptr },
+          "nativeCollectSnapshot",
+          { "()Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_cgroup_snapshot, &g_bridge_cgroup },
 
-    if (!g_bridge_native_root &&
-        hook_bridge_method(env,
-            "com.eltavine.duckdetector.features.nativeroot.data.native.NativeRootNativeBridge",
+        { "native_root_noarg",
+          { "com.eltavine.duckdetector.features.nativeroot.data.native.NativeRootNativeBridge",
             "com.eltavine.duckdetector.features.nativeroot.data.p009native.NativeRootNativeBridge",
-            "nativeCollectSnapshot", "(Z)Ljava/lang/String;",
-            (void *)h_duck_native_root_snapshot)) {
-        g_bridge_native_root = true;
-        ++newly;
+            nullptr },
+          "nativeCollectSnapshot",
+          { "()Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_native_root_snapshot_noarg, &g_bridge_native_root },
+
+        { "native_root_bool",
+          { "com.eltavine.duckdetector.features.nativeroot.data.native.NativeRootNativeBridge",
+            "com.eltavine.duckdetector.features.nativeroot.data.p009native.NativeRootNativeBridge",
+            nullptr },
+          "nativeCollectSnapshot",
+          { "(Z)Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_native_root_snapshot, &g_bridge_native_root },
+
+        { "throne_hunt_install",
+          { "com.eltavine.duckdetector.features.nativeroot.data.native.ThroneHuntWatchNativeBridge",
+            nullptr, nullptr },
+          "nativeInstallWatch",
+          { "(Ljava/lang/String;)Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_throne_install, &g_bridge_throne_install },
+
+        { "throne_hunt_drain",
+          { "com.eltavine.duckdetector.features.nativeroot.data.native.ThroneHuntWatchNativeBridge",
+            nullptr, nullptr },
+          "nativeDrainWatch",
+          { "(I)Ljava/lang/String;", nullptr, nullptr },
+          (void *)h_duck_throne_drain, &g_bridge_throne_drain },
+    };
+
+    const int spec_count = (int)(sizeof(kBridgeSpecs) / sizeof(kBridgeSpecs[0]));
+    int ready = 0;
+    for (int i = 0; i < spec_count; ++i) {
+        if (*kBridgeSpecs[i].flag) {
+            ++ready;
+            continue;
+        }
+        if (try_register_bridge(env, &kBridgeSpecs[i])) {
+            *kBridgeSpecs[i].flag = true;
+            ++ready;
+            ++newly;
+        }
     }
 
-    const int total = (g_bridge_props ? 1 : 0) + (g_bridge_pif ? 1 : 0) +
-        (g_bridge_dangerous ? 1 : 0) + (g_bridge_memory ? 1 : 0) +
-        (g_bridge_lsposed ? 1 : 0) + (g_bridge_zygisk ? 1 : 0) +
-        (g_bridge_su ? 1 : 0) + (g_bridge_cgroup ? 1 : 0) +
-        (g_bridge_native_root ? 1 : 0);
-    if (newly > 0 || total < 9) {
-        LOGI("[%s] Duck native bridge hooks ready=%d/9 newly=%d",
-             g_app_name, total, newly);
+    if (newly > 0 || ready < spec_count) {
+        char missing[384];
+        missing[0] = '\0';
+        for (int i = 0; i < spec_count; ++i) {
+            if (*kBridgeSpecs[i].flag) continue;
+            if (missing[0]) {
+                strncat(missing, ",", sizeof(missing) - strlen(missing) - 1);
+            }
+            strncat(missing, kBridgeSpecs[i].label,
+                    sizeof(missing) - strlen(missing) - 1);
+        }
+        LOGI("[%s] Duck native bridge hooks ready=%d/%d newly=%d missing=[%s]",
+             g_app_name, ready, spec_count, newly, missing);
     }
     pthread_mutex_unlock(&g_bridge_lock);
-    return total;
+    return ready;
 }
 
 static int __attribute__((unused)) register_plt_hooks();
@@ -2047,6 +2347,7 @@ static int __attribute__((unused)) register_plt_hooks() {
 
 static void install_jni_hooks(JNIEnv *env) {
     if (!g_api || !env) return;
+    load_module_config_once();
     pthread_mutex_lock(&g_jni_lock);
     if (g_core_jni_installed) {
         pthread_mutex_unlock(&g_jni_lock);

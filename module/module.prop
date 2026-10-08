@@ -1,7 +1,7 @@
 id=anti_dev_pm_zygisk
 name=Anti-Dev-Adb-pm
-version=v2.6.3
-versionCode=20603
+version=v2.6.5
+versionCode=20605
 author=geekbyte
-description=DuckDetector-scoped observation bypass for Duck 2026.09 builds: capability/feature bridge realignment, per-bridge hook diagnostics, USB/ADB property row hiding, robust libc property reads, refreshed native snapshot payloads, plus MIUI/HyperOS inventory appop fixer and SDK fallback. No pm hide, no ADB disable.
+description=Target-scoped observation bypass for DuckDetector and TrustAttestor: Duck ADB Runtime USB_STATE sticky-broadcast flag cleared on the Binder reply, TrustAttestor (com.lingqing.trustattestor) ADB property profile via a direct GOT patch in libTrustAttestor.so, capability/feature bridge realignment, per-bridge hook diagnostics, USB/ADB property row hiding, robust libc property reads, refreshed native snapshot payloads, plus MIUI/HyperOS inventory appop fixer and SDK fallback. No pm hide, no ADB disable, no property-area writes.
 updateJson=

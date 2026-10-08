@@ -1,7 +1,7 @@
 # anti_dev_pm_zygisk
 
 Author: geekbyte  
-Version: v2.5.7
+Version: v2.6.5
 
 Standalone Zygisk module for DuckDetector visibility checks.
 
@@ -21,6 +21,7 @@ Target process:
 
 ```text
 com.eltavine.duckdetector
+com.lingqing.trustattestor        # v2.6.5: one direct GOT patch, ADB properties only
 ```
 
 It is intentionally separate from `selinux_avc_bypass_zygisk` and does not hook
@@ -39,6 +40,47 @@ module/inventory_worker.sh
 The service only touches the MIUI/HyperOS installed-app inventory appop for
 DuckDetector and manually configured targets. It skips non-MIUI ROMs by default
 and skips ROMs where op `10022` is unsupported.
+
+## v2.6.5 changes (2026-10-08)
+
+Two target-scoped fixes, both reworked after the on-device verification of v2.6.4 (where
+neither took effect). Nothing else in the module changed.
+
+1. DuckDetector `ADB Runtime` card (`feature/adbruntime`, Duck `2026.10.07-598b76283fa5`)
+   reads the `android.hardware.usb.action.USB_STATE` sticky broadcast and treats a visible
+   `adb` function flag as ADB activity. That `registerReceiver` request carries Binder
+   objects, so `Parcel.marshall()` refuses it and the request can never be rewritten; the
+   reply (the sticky Intent) can be. The module now clears just that one boolean in the reply
+   extras, so the card sees `mtp` instead of `adb` while `connected`/`configured` stay real.
+   The other five ADB Runtime sources were already covered.
+2. TrustAttestor (`com.lingqing.trustattestor`, v1.5) runs its whole ADB check through libc
+   `__system_property_get` inside `libTrustAttestor.so` (64 call sites, the only property
+   symbol it imports), over `init.svc.adbd`, `service.adb.root`, `persist.security.adbinput`,
+   `persist.security.adbinstall` and the `persist.sys.usb.config` / `sys.usb.config` /
+   `sys.usb.state` USB trio. The app mprotects its own RELRO/data mappings to write-only right
+   after dlopen, which makes Zygisk's `pltHookRegister`/lsplt fail against this library, so
+   the module locates the `__system_property_get` GOT slot from the library file and patches
+   that slot directly. No file, Binder or JNI hook is installed in that process, and no other
+   property changes value.
+
+Both targets keep their real device state: the module never writes the property area, never
+touches adbd, and never changes the ADB or developer-options setting, so ADB keeps working
+normally outside the two app processes.
+
+Verify:
+
+```sh
+su -c "logcat -d -s DuckVisBypass" | grep -E "cleared USB_STATE|got patch ok|property hook ready|active"
+# DuckDetector: "cleared USB_STATE adb flag" appears on each scan;
+#               ADB Runtime -> "ADB state consistent"; USB runtime row lists mtp instead of adb
+# TrustAttestor: "got patch ok ... sane=1" + "property hook ready";
+#               设备环境 no longer lists "检测到 ADB 调试痕迹"
+```
+
+Known residual, intentionally not part of v2.6.5: with Wireless debugging enabled, Duck's
+ADB Runtime can still see a local ADB mDNS service, and because `init.svc.adbd` is reported
+as `stopped` a protocol-confirmed endpoint can escalate that card to Danger. Keep wireless
+debugging off, or handle the mDNS source in a later revision.
 
 ## What It Hooks
 

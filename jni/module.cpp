@@ -1,4 +1,4 @@
-// anti_dev_pm_zygisk v2.6.3
+// anti_dev_pm_zygisk v2.6.5
 // v2.6.0: Duck 2026.09.x (origin/main) bridge-name/signature realignment, per-bridge
 //         self-healing registration with failure logging, and opt-out USB/ADB row hiding.
 // v2.6.1: drop the dead nativeResetWatch registration (not present in the shipped APK),
@@ -10,15 +10,28 @@
 // v2.6.3: resolve libc property symbols through an explicit libc.so handle (and a
 //         link-time fallback) because Zygisk module libraries cannot see libc through
 //         RTLD_DEFAULT; restores real values on the native read path.
-// DuckDetector-scoped observation bypass:
+// v2.6.4: two target-scoped fixes, no changes to any other behaviour.
+//         a) TrustAttestor (com.lingqing.trustattestor) becomes a second target with a
+//            minimal profile: exactly one PLT hook for __system_property_get inside its
+//            own libTrustAttestor.so, plus the four ADB properties its ADB check reads.
+// v2.6.5: both ADB fixes reworked after on-device verification of v2.6.4.
+//         a) TrustAttestor's own RELRO/data mappings are mprotect'ed to write-only right
+//            after dlopen, so Zygisk's pltHookRegister/lsplt can never patch the slot
+//            (commit fails with an unset backup pointer). The GOT slot is patched directly.
+//         b) DuckDetector's registerReceiver request carries Binder objects, so its Parcel
+//            can never be marshalled; the USB_STATE "adb" flag is cleared on the reply
+//            (the sticky Intent) instead of on the request.
+// Target-scoped observation bypass (DuckDetector + TrustAttestor):
 //   - Does not hide, disable, stop, or uninstall any real package/service.
-//   - Spoofs Duck-visible ADB/developer system properties.
+//   - Spoofs ADB/developer system properties only inside the target process.
+//   - Never writes the real property area, so adb and the ROM keep working normally.
 //   - Sanitizes Binder Parcel replies for PackageManager/Settings observations.
-//   - Suppresses Duck's native filesystem/process probes for risky app evidence.
+//   - Suppresses the target's native filesystem/process probes for risky app evidence.
 
 #include <android/log.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -30,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
@@ -37,7 +51,7 @@
 
 #include "zygisk.hpp"
 
-#define MODULE_VERSION "v2.6.3"
+#define MODULE_VERSION "v2.6.5"
 #define LOG_TAG "DuckVisBypass"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
@@ -121,6 +135,24 @@ static bool is_usb_config_prop(const char *name) {
     return false;
 }
 
+// v2.6.4: second target. TrustAttestor (com.lingqing.trustattestor) reads its ADB signals
+// through libc __system_property_get inside its own libTrustAttestor.so, so only the
+// properties that check actually looks at are spoofed. Everything else the app reads keeps
+// its real value, which keeps the other checks in that app untouched.
+static bool g_target_trustattestor = false;
+
+static const PropSpoof kTrustAttestorSpoofs[] = {
+    // PropEquals("init.svc.adbd", "running")
+    { "init.svc.adbd",               "stopped" },
+    // PropNotEmpty("service.adb.root") - must be empty, "0" would still hit.
+    { "service.adb.root",            "" },
+    // PropNotEmpty("persist.security.adbinput") - MIUI/HyperOS "USB debugging (Security settings)".
+    { "persist.security.adbinput",   "" },
+    // PropNotEmpty("persist.security.adbinstall") - MIUI/HyperOS "Install via USB".
+    { "persist.security.adbinstall", "" },
+    { nullptr, nullptr },
+};
+
 // v2.6.0: when hide_adb_usb_rows=1 (default), USB config properties are reported as
 // empty on every read path, so DuckDetector drops the rule row entirely instead of
 // showing a sanitized "mtp" row plus a source-mismatch warning.
@@ -173,7 +205,8 @@ static void load_module_config_once() {
 
 static const char *static_spoof_prop(const char *name) {
     if (!name || !*name) return nullptr;
-    for (const PropSpoof *p = kPropSpoofs; p->name; ++p) {
+    const PropSpoof *table = g_target_trustattestor ? kTrustAttestorSpoofs : kPropSpoofs;
+    for (const PropSpoof *p = table; p->name; ++p) {
         if (strcmp(name, p->name) == 0) return p->value;
     }
     return nullptr;
@@ -1266,6 +1299,44 @@ static bool write_bytes_to_parcel(JNIEnv *env, jobject parcel,
     return ok;
 }
 
+// v2.6.5: DuckDetector's ADB Runtime card reads the android.hardware.usb.action.USB_STATE
+// sticky broadcast through registerReceiver(null, filter). That request carries Binder
+// objects (IApplicationThread), so Parcel.marshall() refuses it and the request side can
+// never be inspected or rewritten. The reply - the sticky Intent - can be marshalled, and
+// its extras hold one boolean per applied USB function. A visible "adb" one is exactly what
+// the card counts as ADB activity, so that single value is cleared on the way back.
+static bool reply_is_usb_state(const unsigned char *buf, size_t len) {
+    return parcel_bytes_contain_ascii_or_utf16(buf, len, "connected") &&
+           parcel_bytes_contain_ascii_or_utf16(buf, len, "configured") &&
+           parcel_bytes_contain_ascii_or_utf16(buf, len, "adb");
+}
+
+// Bundle wire form: key (String16), then an int32 type tag, then the value. "adb" is a
+// 3-character String16, so two padding bytes follow it before VAL_BOOLEAN (9) + 0/1.
+static bool clear_usb_state_adb_flag(unsigned char *buf, size_t len) {
+    static const unsigned char kAdbKey[] = {
+        0x03, 0x00, 0x00, 0x00, 'a', 0x00, 'd', 0x00, 'b', 0x00, 0x00, 0x00,
+    };
+    const size_t key_len = sizeof(kAdbKey);
+    if (!buf || len < key_len + 8) return false;
+    bool changed = false;
+    for (size_t i = 0; i + key_len + 8 <= len; ++i) {
+        if (memcmp(buf + i, kAdbKey, key_len) != 0) continue;
+        const size_t limit = i + key_len + 16;
+        for (size_t j = i + key_len; j + 8 <= len && j <= limit; ++j) {
+            if (buf[j] != 0x09 || buf[j + 1] || buf[j + 2] || buf[j + 3]) continue;
+            if (buf[j + 4] != 0x01 || buf[j + 5] || buf[j + 6] || buf[j + 7]) continue;
+            buf[j + 4] = 0;
+            buf[j + 5] = 0;
+            buf[j + 6] = 0;
+            buf[j + 7] = 0;
+            changed = true;
+            break;
+        }
+    }
+    return changed;
+}
+
 static jboolean h_binder_transact(JNIEnv *env, jobject thiz, jint code,
                                   jobject data, jobject reply, jint flags) {
     bool relevant = false;
@@ -1312,9 +1383,11 @@ static jboolean h_binder_transact(JNIEnv *env, jobject thiz, jint code,
         return rc;
     }
 
+    const auto *reply_u = (const unsigned char *)reply_bytes;
+    bool usb_state_reply = reply_is_usb_state(reply_u, (size_t)reply_len);
     bool has_hidden = parcel_bytes_contain_any(
-        (const unsigned char *)reply_bytes, (size_t)reply_len, kLineDropTokens);
-    if (relevant || has_hidden || direct_hidden_pkg) {
+        reply_u, (size_t)reply_len, kLineDropTokens);
+    if (relevant || has_hidden || direct_hidden_pkg || usb_state_reply) {
         unsigned char *copy = (unsigned char *)malloc((size_t)reply_len);
         if (copy) {
             memcpy(copy, reply_bytes, (size_t)reply_len);
@@ -1324,6 +1397,10 @@ static jboolean h_binder_transact(JNIEnv *env, jobject thiz, jint code,
             }
             changed |= sanitize_parcel_bytes(copy, (size_t)reply_len,
                                              settings_request);
+            if (usb_state_reply && clear_usb_state_adb_flag(copy, (size_t)reply_len)) {
+                changed = true;
+                LOGI("[%s] cleared USB_STATE adb flag code=%d", g_app_name, (int)code);
+            }
             if (changed) {
                 (void)write_bytes_to_parcel(env, reply, copy, reply_len);
                 LOGD("[%s] sanitized Binder reply code=%d", g_app_name, (int)code);
@@ -2342,6 +2419,284 @@ static int __attribute__((unused)) register_plt_hooks() {
 #undef REG_HOOK
 
 // ---------------------------------------------------------------------------
+// TrustAttestor target: direct GOT patch for __system_property_get
+// ---------------------------------------------------------------------------
+
+// v2.6.5: TrustAttestor reads its ADB properties with libc __system_property_get from inside
+// libTrustAttestor.so (the only property symbol that library imports, called from 64 sites).
+// Zygisk's pltHookRegister() cannot be used for this target: right after dlopen the app
+// mprotect()s its own RELRO/data mappings to write-only, and lsplt drops every mapping
+// without PROT_READ, so pltHookCommit() fails and leaves the backup pointer unset (observed
+// on device as "committed=0 old=0x0"). The GOT slot is therefore patched directly, which does
+// not depend on the mapping being readable. It stays clear of the app's own integrity checks:
+// nothing touches libc's executable segments (text-section CRC check) and the libc API owners
+// validated through dlsym() are untouched.
+static const char kTrustAttestorLibName[] = "libTrustAttestor.so";
+static const char kSystemPropertyGetSymbol[] = "__system_property_get";
+
+struct MappedLib {
+    char path[256];
+    uintptr_t base;
+};
+
+// The first mapping of a library (file offset 0) is its load base.
+static bool find_mapped_lib(const char *lib_name, MappedLib *out) {
+    if (!lib_name || !out) return false;
+    FILE *fp = fopen("/proc/self/maps", "re");
+    if (!fp) return false;
+    bool found = false;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        char *path = strchr(line, '/');
+        if (!path) continue;
+        size_t len = strlen(path);
+        if (len && path[len - 1] == '\n') path[--len] = '\0';
+        char *deleted = strstr(path, " (deleted)");
+        if (deleted) *deleted = '\0';
+        if (strcmp(base_name(path), lib_name) != 0) continue;
+        unsigned long start = 0;
+        unsigned long offset = 0;
+        if (sscanf(line, "%lx-%*lx %*4s %lx", &start, &offset) != 2) continue;
+        if (offset != 0 || start == 0) continue;
+        snprintf(out->path, sizeof(out->path), "%s", path);
+        out->base = (uintptr_t)start;
+        found = true;
+        break;
+    }
+    fclose(fp);
+    return found;
+}
+
+// Permissions of the mapping that contains `addr` inside `lib_name`.
+static bool find_mapping_prot(const char *lib_name, uintptr_t addr, int *out_prot) {
+    if (!lib_name || !out_prot) return false;
+    FILE *fp = fopen("/proc/self/maps", "re");
+    if (!fp) return false;
+    bool found = false;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long start = 0;
+        unsigned long end = 0;
+        char perms[8] = {};
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
+        if (addr < (uintptr_t)start || addr >= (uintptr_t)end) continue;
+        char *path = strchr(line, '/');
+        if (!path) continue;
+        size_t len = strlen(path);
+        if (len && path[len - 1] == '\n') path[--len] = '\0';
+        char *deleted = strstr(path, " (deleted)");
+        if (deleted) *deleted = '\0';
+        if (strcmp(base_name(path), lib_name) != 0) continue;
+        int prot = 0;
+        if (perms[0] == 'r') prot |= PROT_READ;
+        if (perms[1] == 'w') prot |= PROT_WRITE;
+        if (perms[2] == 'x') prot |= PROT_EXEC;
+        *out_prot = prot;
+        found = true;
+        break;
+    }
+    fclose(fp);
+    return found;
+}
+
+static bool read_file_at(FILE *fp, uint64_t offset, void *buf, size_t size) {
+    if (!fp || !buf || size == 0) return false;
+    if (fseeko(fp, (off_t)offset, SEEK_SET) != 0) return false;
+    return fread(buf, 1, size, fp) == size;
+}
+
+static bool vaddr_to_file_offset(const Elf64_Phdr *loads, size_t count, uint64_t vaddr,
+                                 uint64_t *out_offset) {
+    for (size_t i = 0; i < count; ++i) {
+        if (vaddr < loads[i].p_vaddr) continue;
+        if (vaddr >= loads[i].p_vaddr + loads[i].p_memsz) continue;
+        *out_offset = loads[i].p_offset + (vaddr - loads[i].p_vaddr);
+        return true;
+    }
+    return false;
+}
+
+// Reads the GOT slot offset (a vaddr) of `symbol` straight from the library file, so the
+// lookup never has to read the app's write-only mappings.
+static bool find_got_slot_offset(const char *path, const char *symbol,
+                                 uint64_t *out_offset) {
+    if (!path || !symbol || !out_offset) return false;
+    FILE *fp = fopen(path, "re");
+    if (!fp) return false;
+
+    bool found = false;
+    Elf64_Ehdr eh {};
+    Elf64_Phdr loads[8] = {};
+    size_t load_count = 0;
+    uint64_t dynamic_offset = 0;
+    if (read_file_at(fp, 0, &eh, sizeof(eh)) &&
+        memcmp(eh.e_ident, ELFMAG, SELFMAG) == 0 &&
+        eh.e_phentsize == sizeof(Elf64_Phdr)) {
+        for (uint16_t i = 0; i < eh.e_phnum && i < 64; ++i) {
+            Elf64_Phdr ph {};
+            if (!read_file_at(fp, eh.e_phoff + (uint64_t)i * eh.e_phentsize,
+                              &ph, sizeof(ph))) {
+                break;
+            }
+            if (ph.p_type == PT_LOAD && load_count < 8) {
+                loads[load_count++] = ph;
+            } else if (ph.p_type == PT_DYNAMIC) {
+                dynamic_offset = ph.p_offset;
+            }
+        }
+    }
+
+    uint64_t symtab = 0;
+    uint64_t strtab = 0;
+    uint64_t jmprel = 0;
+    uint64_t pltrelsz = 0;
+    if (dynamic_offset) {
+        for (int i = 0; i < 512; ++i) {
+            Elf64_Dyn dyn {};
+            if (!read_file_at(fp, dynamic_offset + (uint64_t)i * sizeof(dyn),
+                              &dyn, sizeof(dyn))) {
+                break;
+            }
+            if (dyn.d_tag == DT_NULL) break;
+            if (dyn.d_tag == DT_SYMTAB) symtab = dyn.d_un.d_ptr;
+            else if (dyn.d_tag == DT_STRTAB) strtab = dyn.d_un.d_ptr;
+            else if (dyn.d_tag == DT_JMPREL) jmprel = dyn.d_un.d_ptr;
+            else if (dyn.d_tag == DT_PLTRELSZ) pltrelsz = dyn.d_un.d_val;
+        }
+    }
+
+    uint64_t symtab_offset = 0;
+    uint64_t strtab_offset = 0;
+    uint64_t rela_offset = 0;
+    if (symtab && strtab && jmprel && pltrelsz &&
+        vaddr_to_file_offset(loads, load_count, symtab, &symtab_offset) &&
+        vaddr_to_file_offset(loads, load_count, strtab, &strtab_offset) &&
+        vaddr_to_file_offset(loads, load_count, jmprel, &rela_offset)) {
+        const size_t rela_count = (size_t)(pltrelsz / sizeof(Elf64_Rela));
+        for (size_t i = 0; i < rela_count; ++i) {
+            Elf64_Rela rela {};
+            if (!read_file_at(fp, rela_offset + (uint64_t)i * sizeof(rela),
+                              &rela, sizeof(rela))) {
+                break;
+            }
+            const uint32_t sym_index = (uint32_t)(rela.r_info >> 32);
+            Elf64_Sym sym {};
+            if (!read_file_at(fp, symtab_offset + (uint64_t)sym_index * sizeof(sym),
+                              &sym, sizeof(sym))) {
+                break;
+            }
+            char name[128] = {};
+            if (!read_file_at(fp, strtab_offset + sym.st_name, name,
+                              sizeof(name) - 1)) {
+                continue;
+            }
+            if (strcmp(name, symbol) == 0) {
+                *out_offset = rela.r_offset;
+                found = true;
+                break;
+            }
+        }
+    }
+
+    fclose(fp);
+    return found;
+}
+
+static void *resolve_libc_property_get() {
+    void *libc = dlopen("libc.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!libc) libc = dlopen("libc.so", RTLD_NOW);
+    void *fn = libc ? dlsym(libc, kSystemPropertyGetSymbol) : nullptr;
+    if (!fn) fn = dlsym(RTLD_DEFAULT, kSystemPropertyGetSymbol);
+    return fn;
+}
+
+// Overwrites one GOT slot. The page is already writable in this process, but the app may
+// have cleared PROT_READ on it, so read+writability is enabled only around the store and the
+// original permissions are restored afterwards.
+static bool patch_lib_got_slot(const char *lib_name, const MappedLib &lib,
+                               uint64_t slot_offset, void *new_func,
+                               void **out_previous) {
+    const uintptr_t slot = lib.base + (uintptr_t)slot_offset;
+    int original_prot = 0;
+    if (!find_mapping_prot(lib_name, slot, &original_prot)) return false;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return false;
+    const uintptr_t page_start = slot & ~((uintptr_t)page_size - 1);
+    const uintptr_t page_end = page_start + (uintptr_t)page_size;
+    if (slot + sizeof(void *) > page_end) return false;
+    if (mprotect((void *)page_start, (size_t)page_size,
+                 PROT_READ | PROT_WRITE) != 0) {
+        return false;
+    }
+    void **target = (void **)slot;
+    if (out_previous) *out_previous = *target;
+    *target = new_func;
+    __builtin___clear_cache((char *)page_start, (char *)page_end);
+    if (mprotect((void *)page_start, (size_t)page_size, original_prot) != 0) {
+        LOGW("[%s] restore mapping perms failed at %p", g_app_name, (void *)page_start);
+    }
+    return true;
+}
+
+// The library is loaded by System.loadLibrary() after this hook point, so the worker below
+// waits for it. The patch itself happens only once, so a retry can never overwrite the slot
+// with our own shim.
+static bool g_trustattestor_hook_done = false;
+
+static bool install_trustattestor_prop_hook() {
+    if (g_trustattestor_hook_done) return o_sys_prop_get != nullptr;
+    MappedLib lib {};
+    if (!find_mapped_lib(kTrustAttestorLibName, &lib)) return false;
+    g_trustattestor_hook_done = true;
+
+    o_sys_prop_get = (prop_get_fn)resolve_libc_property_get();
+    if (!o_sys_prop_get) {
+        LOGW("[%s] libc %s is not resolvable", g_app_name, kSystemPropertyGetSymbol);
+        return false;
+    }
+    uint64_t slot_offset = 0;
+    if (!find_got_slot_offset(lib.path, kSystemPropertyGetSymbol, &slot_offset)) {
+        LOGW("[%s] %s GOT slot not found in %s", g_app_name,
+             kSystemPropertyGetSymbol, lib.path);
+        return false;
+    }
+    void *previous = nullptr;
+    if (!patch_lib_got_slot(kTrustAttestorLibName, lib, slot_offset,
+                            (void *)h_sys_prop_get, &previous)) {
+        LOGW("[%s] %s GOT patch failed base=%p slot=+0x%" PRIx64, g_app_name,
+             kSystemPropertyGetSymbol, (void *)lib.base, slot_offset);
+        return false;
+    }
+    LOGI("[%s] got patch ok base=%p slot=+0x%" PRIx64 " old=%p sane=%d", g_app_name,
+         (void *)lib.base, slot_offset, previous,
+         previous == (void *)o_sys_prop_get ? 1 : 0);
+    return true;
+}
+
+static void *trustattestor_hook_worker(void *) {
+    for (int attempt = 0; attempt < 400; ++attempt) {
+        if (install_trustattestor_prop_hook()) {
+            LOGI("[%s] %s property hook ready", g_app_name, kTrustAttestorLibName);
+            return nullptr;
+        }
+        if (g_trustattestor_hook_done) break;
+        usleep(50 * 1000);
+    }
+    LOGW("[%s] %s property hook not installed", g_app_name, kTrustAttestorLibName);
+    return nullptr;
+}
+
+static void install_trustattestor_hooks() {
+    load_module_config_once();
+    pthread_t t;
+    if (pthread_create(&t, nullptr, trustattestor_hook_worker, nullptr) == 0) {
+        pthread_detach(t);
+    } else {
+        LOGW("[%s] trustattestor hook worker not started", g_app_name);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // JNI hooks
 // ---------------------------------------------------------------------------
 
@@ -2478,6 +2833,11 @@ public:
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
         if (!target) return;
+        if (g_target_trustattestor) {
+            install_trustattestor_hooks();
+            LOGI("[%s] %s active", g_app_name, MODULE_VERSION);
+            return;
+        }
         install_jni_hooks(env);
         int sdk = g_real_sdk_before_spoof > 0 ?
             g_real_sdk_before_spoof : get_runtime_sdk(env);
@@ -2533,6 +2893,16 @@ private:
         if (jstr_has(e, args->nice_name, "com.eltavine.duckdetector") ||
             jstr_has(e, args->app_data_dir, "com.eltavine.duckdetector")) {
             LOGI("[duckdetector] skip helper process outside allowlist");
+        }
+
+        // v2.6.4: TrustAttestor runs its whole scan in the main process.
+        if (jstr_eq(e, args->nice_name, "com.lingqing.trustattestor")) {
+            g_target_trustattestor = true;
+            snprintf(g_app_name, sizeof(g_app_name), "trustattestor");
+            return true;
+        }
+        if (jstr_has(e, args->app_data_dir, "com.lingqing.trustattestor")) {
+            LOGI("[trustattestor] skip helper process outside allowlist");
         }
         return false;
     }

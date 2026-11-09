@@ -21,6 +21,18 @@
 //         b) DuckDetector's registerReceiver request carries Binder objects, so its Parcel
 //            can never be marshalled; the USB_STATE "adb" flag is cleared on the reply
 //            (the sticky Intent) instead of on the request.
+// v2.6.7: Duck 2026.11 ADB Runtime socket contradictions. init.svc.adbd is already
+//         reported stopped in-process, but feature/adbruntime now cross-checks two
+//         syscall-level surfaces that the property/Binder hooks never touched:
+//           a) AdbJdwpSocketBridge.nativeConnectErrno -> connect("\0jdwp-control").
+//              Register that JNI entry point to report ECONNREFUSED, which Duck maps
+//              to NOT_OBSERVED, instead of the real connected listener.
+//           b) AdbInitSocketProbe reads File("/dev/socket").list() through
+//              UnixFileSystem.list0(File). Remove only the single "adbd" entry from
+//              that one listing; resolveInitSocketPresence() then degrades the stat()
+//              EACCES (PRESENT_DENIED) to UNKNOWN, so initSocket.present is null and
+//              no stopped-init contradiction is produced. No stat native is replaced,
+//              and no other directory/listing is altered.
 // Target-scoped observation bypass (DuckDetector + TrustAttestor):
 //   - Does not hide, disable, stop, or uninstall any real package/service.
 //   - Spoofs ADB/developer system properties only inside the target process.
@@ -51,7 +63,7 @@
 
 #include "zygisk.hpp"
 
-#define MODULE_VERSION "v2.6.5"
+#define MODULE_VERSION "v2.6.7"
 #define LOG_TAG "DuckVisBypass"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
@@ -1706,6 +1718,149 @@ static jstring h_duck_throne_drain(JNIEnv *env, jobject thiz, jint descriptor) {
 // ThroneHuntWatchNativeBridge (verified through ART's RegisterNatives failure dump),
 // so v2.6.1 does not try to register one.
 
+// ---------------------------------------------------------------------------
+// v2.6.7: Duck 2026.11 ADB Runtime socket observations
+// ---------------------------------------------------------------------------
+
+// Duck's AdbJdwpSocketBridge.nativeConnectErrno returns the raw errno of one
+// connect(AF_UNIX, SOCK_SEQPACKET) to the abstract name "\0jdwp-control".
+// AdbJdwpSocketProbe.classifyAbstractConnect() maps ECONNREFUSED (111) and
+// ENOENT to NOT_OBSERVED; 0 / EACCES / EPERM mean the listener is present.
+// The module already reports init.svc.adbd=stopped inside DuckDetector, so the
+// real "connected" answer is what produces the "ADB JDWP socket vs init"
+// contradiction. Return ECONNREFUSED for this one app-owned JNI entry point:
+// no socket is closed, no property is written, and no other process is touched.
+static jint h_duck_jdwp_connect_errno(JNIEnv *env, jobject thiz,
+                                      jstring name, jboolean abstract_name) {
+    (void)env;
+    (void)thiz;
+    (void)name;
+    (void)abstract_name;
+    return 111;  // ECONNREFUSED -> AdbProbeState.NOT_OBSERVED
+}
+
+// java.io.UnixFileSystem.list0(File) is the private native behind
+// File.list(). AdbInitSocketProbe.read() lists "/dev/socket" and then calls
+// resolveInitSocketPresence(): when the listing does not contain "adbd", an
+// EACCES stat() result (PRESENT_DENIED) is deliberately degraded to UNKNOWN,
+// i.e. initSocket.present == null. That is exactly Duck's own "listing and
+// stat disagree" safety valve, so removing just this one name is enough to
+// stop the "ADB init socket vs init" finding without replacing any stat native.
+static jobjectArray (*o_unix_fs_list0)(JNIEnv *, jobject, jobject) = nullptr;
+static bool g_unix_fs_list0_hooked = false;
+
+static jobjectArray h_unix_fs_list0(JNIEnv *env, jobject thiz, jobject file) {
+    jobjectArray result = o_unix_fs_list0
+        ? o_unix_fs_list0(env, thiz, file)
+        : nullptr;
+    if (!result || !file) return result;
+
+    jclass file_cls = env->FindClass("java/io/File");
+    if (!file_cls) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return result;
+    }
+    jmethodID get_path = env->GetMethodID(file_cls, "getPath",
+                                          "()Ljava/lang/String;");
+    env->DeleteLocalRef(file_cls);
+    if (!get_path) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return result;
+    }
+    jstring path_j = (jstring)env->CallObjectMethod(file, get_path);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return result;
+    }
+    bool is_socket_dir = false;
+    if (path_j) {
+        const char *path = env->GetStringUTFChars(path_j, nullptr);
+        if (path) {
+            is_socket_dir = strcmp(path, "/dev/socket") == 0;
+            env->ReleaseStringUTFChars(path_j, path);
+        }
+        env->DeleteLocalRef(path_j);
+    }
+    if (!is_socket_dir) return result;
+
+    const jsize count = env->GetArrayLength(result);
+    jsize hits = 0;
+    for (jsize i = 0; i < count; ++i) {
+        jstring entry = (jstring)env->GetObjectArrayElement(result, i);
+        if (entry) {
+            const char *s = env->GetStringUTFChars(entry, nullptr);
+            if (s) {
+                if (strcmp(s, "adbd") == 0) ++hits;
+                env->ReleaseStringUTFChars(entry, s);
+            }
+            env->DeleteLocalRef(entry);
+        }
+    }
+    if (hits == 0) return result;
+
+    jclass str_cls = env->FindClass("java/lang/String");
+    if (!str_cls) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return result;
+    }
+    jobjectArray filtered = env->NewObjectArray(count - hits, str_cls, nullptr);
+    env->DeleteLocalRef(str_cls);
+    if (!filtered) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return result;
+    }
+    jsize out = 0;
+    for (jsize i = 0; i < count; ++i) {
+        jstring entry = (jstring)env->GetObjectArrayElement(result, i);
+        bool drop = false;
+        if (entry) {
+            const char *s = env->GetStringUTFChars(entry, nullptr);
+            if (s) {
+                drop = strcmp(s, "adbd") == 0;
+                env->ReleaseStringUTFChars(entry, s);
+            }
+        }
+        if (!drop && entry) {
+            env->SetObjectArrayElement(filtered, out++, entry);
+        }
+        if (entry) env->DeleteLocalRef(entry);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            env->DeleteLocalRef(filtered);
+            return result;
+        }
+    }
+    LOGI("[%s] init socket listing: hid adbd (%d -> %d entries)",
+         g_app_name, (int)count, (int)(count - hits));
+    return filtered;
+}
+
+// Installed through the same retry passes as the app bridge table, but guarded
+// so hookJniNativeMethods() is never applied twice (that would chain our own
+// hook as the "original" pointer). Only the DuckDetector process reaches here.
+static void install_unix_fs_list0_hook(JNIEnv *env) {
+    if (!g_api || !env) return;
+    pthread_mutex_lock(&g_jni_lock);
+    if (g_unix_fs_list0_hooked) {
+        pthread_mutex_unlock(&g_jni_lock);
+        return;
+    }
+    JNINativeMethod list0[] = {
+        { "list0", "(Ljava/io/File;)[Ljava/lang/String;",
+          (void *)h_unix_fs_list0 },
+    };
+    g_api->hookJniNativeMethods(env, "java/io/UnixFileSystem", list0, 1);
+    if (list0[0].fnPtr != (void *)h_unix_fs_list0) {
+        o_unix_fs_list0 = (jobjectArray (*)(JNIEnv *, jobject, jobject))
+            list0[0].fnPtr;
+        g_unix_fs_list0_hooked = true;
+        LOGI("[%s] UnixFileSystem.list0 hook installed", g_app_name);
+    } else if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+    pthread_mutex_unlock(&g_jni_lock);
+}
+
 static bool g_bridge_props = false;
 static bool g_bridge_pif = false;
 static bool g_bridge_dangerous = false;
@@ -1717,6 +1872,7 @@ static bool g_bridge_cgroup = false;
 static bool g_bridge_native_root = false;
 static bool g_bridge_throne_install = false;
 static bool g_bridge_throne_drain = false;
+static bool g_bridge_jdwp_connect = false;
 
 static jclass load_app_class(JNIEnv *env, const char *dot_name) {
     if (!env || !dot_name) return nullptr;
@@ -1921,6 +2077,16 @@ static int install_duck_bridge_hooks(JNIEnv *env) {
           "nativeDrainWatch",
           { "(I)Ljava/lang/String;", nullptr, nullptr },
           (void *)h_duck_throne_drain, &g_bridge_throne_drain },
+
+        // v2.6.7: feature/adbruntime JDWP control-socket probe. The JNI symbol
+        // is exported by libduckdetector_adbruntime.so and has no RegisterNatives
+        // owner, so pre-registering it on the app class takes precedence.
+        { "jdwp_connect",
+          { "com.eltavine.duckdetector.features.adbruntime.data.repository.AdbJdwpSocketBridge",
+            nullptr, nullptr },
+          "nativeConnectErrno",
+          { "(Ljava/lang/String;Z)I", nullptr, nullptr },
+          (void *)h_duck_jdwp_connect_errno, &g_bridge_jdwp_connect },
     };
 
     const int spec_count = (int)(sizeof(kBridgeSpecs) / sizeof(kBridgeSpecs[0]));
@@ -1952,6 +2118,9 @@ static int install_duck_bridge_hooks(JNIEnv *env) {
              g_app_name, ready, spec_count, newly, missing);
     }
     pthread_mutex_unlock(&g_bridge_lock);
+    // v2.6.7: keep the /dev/socket listing filter alive across the same retry
+    // passes as the bridge table (late-loaded framework class on some builds).
+    install_unix_fs_list0_hook(env);
     return ready;
 }
 
